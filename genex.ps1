@@ -3,10 +3,10 @@ param(
     [string]$Scenario, # Required scenario
     [int]$MaxTotalSize, # Required total size in bytes
     [switch]$RandomSize, # Use random file sizes
-    [switch]$ExactSize,  # Generate files of exact size
-    [int]$ExactFileSize, # Size of each file if ExactSize is specified
-    [int]$FileCount = 5, # Number of files (default: 5)
+    [int]$FileCount,     # Number of files (optional)
     [string[]]$Extensions = @("conf", "sql", "bak", "zip"), # Valid extensions
+    [string]$Keyword,    # Optional keyword to inject into filenames
+    [string]$CreatedDate, # Optional: Created date for files in mm/dd/yyyy format
     [switch]$Help # Display help
 )
 
@@ -18,35 +18,45 @@ Options:
     -Scenario       Required: Specify a scenario ('UserDatabase', 'Backups', or 'Random').
     -MaxTotalSize   Required: Maximum total size for all generated files (in bytes).
     -RandomSize     Generate random file sizes within max total size.
-    -ExactSize      Generate files of exact sizes specified by -ExactFileSize.
-    -ExactFileSize  File size in bytes if ExactSize is specified.
-    -FileCount      Number of files to generate (default: 5).
+    -FileCount      Number of files to generate (optional; default: random between 4 and 10).
     -Extensions     File extensions to use (default: conf, sql, bak, zip).
+    -Keyword        Inject this keyword into some filenames (optional).
+    -CreatedDate    Specify a created date (e.g., "06/15/2023"). Modified dates will be random between created and current date.
     -Help           Display this help information.
 "@
     exit
 }
 
 # Validate required arguments
-if (-not $Scenario -or -not $MaxTotalSize -or (-not $RandomSize -and -not $ExactSize)) {
-    Write-Error "Required options missing: -Scenario, -MaxTotalSize, and one of -RandomSize or -ExactSize."
+if (-not $Scenario -or -not $MaxTotalSize -or (-not $RandomSize)) {
+    Write-Error "Required options missing: -Scenario, -MaxTotalSize, and -RandomSize."
     exit
 }
 
-if ($ExactSize -and (-not $ExactFileSize)) {
-    Write-Error "-ExactFileSize must be provided when -ExactSize is specified."
-    exit
+# Parse CreatedDate
+if ($CreatedDate) {
+    try {
+        # Handle 2-digit year logic
+        $CreatedDate = if ($CreatedDate -match "/\d{2}$") {
+            $Year = [int]($CreatedDate.Split('/')[-1])
+            $Year = if ($Year -le [int](Get-Date -Year (Get-Date).Year).ToString("yy")) {
+                2000 + $Year
+            } else {
+                1900 + $Year
+            }
+            [datetime]::ParseExact("$($CreatedDate.Substring(0, $CreatedDate.Length - 2))/$Year", "MM/dd/yyyy", $null)
+        } else {
+            [datetime]::ParseExact($CreatedDate, "MM/dd/yyyy", $null)
+        }
+    } catch {
+        Write-Error "Invalid -CreatedDate format. Please use mm/dd/yyyy or mm/dd/yy."
+        exit
+    }
 }
 
-# Check available disk space
-$DriveInfo = Get-PSDrive -Name (Get-Location).Drive.Name
-$FreeSpace = $DriveInfo.Free
-if ($MaxTotalSize -gt $FreeSpace) {
-    Write-Error "Not enough free disk space to generate the specified data."
-    exit
-}
-if ($FreeSpace -lt ($FreeSpace - $MaxTotalSize) * 0.05) {
-    Write-Warning "Warning: Disk space usage will exceed 95% of capacity."
+# Determine file count
+if (-not $FileCount) {
+    $FileCount = Get-Random -Minimum 4 -Maximum 10
 }
 
 # Directory creation
@@ -56,59 +66,77 @@ while (Test-Path "$BaseDir$i") { $i++ }
 $TargetDir = "$BaseDir$i"
 New-Item -ItemType Directory -Path $TargetDir | Out-Null
 
-# File templates and names
-$FileTemplates = @{
-    "conf" = "# Configuration File"
-    "sql"  = "-- SQL Dump File"
-    "bak"  = "BAK"
-    "zip"  = [byte[]](0x50, 0x4B, 0x03, 0x04)
-}
-
+# Scenario-specific names and logic
 $NameDictionaries = @{
-    "UserDatabase" = @("users.sql", "schema.sql", "config.conf", "backup2024.bak")
-    "Backups" = @("backup2024.zip", "system.bak", "archive.zip")
-    "Random" = @("random.conf", "temp.sql", "data.zip")
+    "UserDatabase" = @("users.sql", "schema.sql", "config.conf", "backup.bak", "log.sql", "auth.sql")
+    "Backups" = @("full_backup.bak", "incremental_backup.bak", "backup_config.conf", "restore.sql")
+    "Random" = @("random_file.conf", "temp.sql", "archive.zip", "random_data.bak")
 }
 
-# File size allocation
+# Initialize variables
 $TotalSize = 0
-$RemainingSize = $MaxTotalSize
-$MinConfSize = 200
-$MaxConfSize = 20480
+$RemainingSize = [math]::Floor($MaxTotalSize * 0.95) # 95% of MaxTotalSize
+$MinConfSize = 1024    # 1 KB
+$MaxConfSize = 25600   # 25 KB
 $GeneratedFiles = @()
+$UniqueNames = @() # Array for unique filenames
 
+# Generate files
 for ($j = 1; $j -le $FileCount; $j++) {
     $FileType = Get-Random -InputObject $Extensions
-    $FileName = if ($Scenario -ne "Random") {
+
+    # Generate unique filenames
+    $BaseFileName = if ($Scenario -ne "Random") {
         Get-Random -InputObject $NameDictionaries[$Scenario]
     } else {
-        "random_$j.$FileType"
+        "random_file_$j.$FileType"
     }
-    $FileName = "$TargetDir\$FileName"
+
+    # Inject keyword into logical file types (sql, bak) with higher priority
+    if ($Keyword) {
+        $InjectKeyword = $FileType -in @("sql", "bak") -or (Get-Random -Minimum 0 -Maximum 2) -eq 1
+        if ($InjectKeyword) {
+            $BaseFileName = "$Keyword" + "_" + $BaseFileName
+        }
+    }
+
+    # Ensure uniqueness
+    $FileName = "$TargetDir\$BaseFileName"
+    $Counter = 1
+    while ($UniqueNames -contains $FileName) {
+        $FileName = "$TargetDir\$($BaseFileName.Split('.')[0])_$Counter.$FileType"
+        $Counter++
+    }
+    $UniqueNames += $FileName
 
     # Determine file size
     if ($FileType -eq "conf") {
         $FileSize = Get-Random -Minimum $MinConfSize -Maximum $MaxConfSize
-    } elseif ($ExactSize) {
-        $FileSize = $ExactFileSize
     } else {
-        $FileSize = [math]::Min(
-            (Get-Random -Minimum ([math]::Floor($RemainingSize * 0.2)) -Maximum ([math]::Floor($RemainingSize * 0.5))),
-            $RemainingSize
-        )
+        $FileSize = Get-Random -Minimum ([math]::Floor($RemainingSize * 0.1)) -Maximum ([math]::Floor($RemainingSize * 0.4))
     }
 
-    if ($TotalSize + $FileSize -gt $MaxTotalSize) { break }
-
-    # Write file
-    if ($FileTemplates[$FileType] -is [byte[]]) {
-        [System.IO.File]::WriteAllBytes($FileName, $FileTemplates[$FileType])
-    } else {
-        Set-Content -Path $FileName -Value $FileTemplates[$FileType]
+    # Ensure total size does not exceed max
+    if ($TotalSize + $FileSize -gt $MaxTotalSize) {
+        $FileSize = $MaxTotalSize - $TotalSize
     }
 
-    $RandomData = [byte[]](Get-Random -Minimum 0 -Maximum 255) * ($FileSize - 10) # Account for header
-    [System.IO.File]::WriteAllBytes($FileName, $RandomData)
+    # Write random data to file
+    try {
+        $RandomData = [byte[]](Get-Random -Minimum 0 -Maximum 255) * $FileSize
+        [System.IO.File]::WriteAllBytes($FileName, $RandomData)
+
+        # Set created and modified dates
+        if ($CreatedDate) {
+            $ModifiedDate = Get-Random -Minimum $CreatedDate.Ticks -Maximum ([datetime]::Now.Ticks)
+            $ModifiedDate = [datetime]::FromFileTimeUtc($ModifiedDate)
+            (Get-Item $FileName).CreationTime = $CreatedDate
+            (Get-Item $FileName).LastWriteTime = $ModifiedDate
+        }
+    } catch {
+        Write-Error "Failed to write to $FileName. $_"
+        continue
+    }
 
     $TotalSize += $FileSize
     $RemainingSize -= $FileSize
