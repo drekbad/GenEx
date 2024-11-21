@@ -1,12 +1,11 @@
 param(
     [ValidateSet("UserDatabase", "Backups", "Random")]
     [string]$Scenario, # Required scenario
-    [int]$MaxTotalSize, # Required total size in bytes
+    [Int64]$MaxTotalSize, # Required total size in bytes
     [switch]$RandomSize, # Use random file sizes
-    [int]$FileCount,     # Number of files (optional)
     [string[]]$Extensions = @("conf", "sql", "bak", "zip"), # Valid extensions
     [string]$Keyword,    # Optional keyword to inject into filenames
-    [string]$CreatedDate, # Optional: Created date for files in mm/dd/yyyy format
+    [string]$CreatedDate, # Optional: Created date for files
     [switch]$Help # Display help
 )
 
@@ -18,45 +17,55 @@ Options:
     -Scenario       Required: Specify a scenario ('UserDatabase', 'Backups', or 'Random').
     -MaxTotalSize   Required: Maximum total size for all generated files (in bytes).
     -RandomSize     Generate random file sizes within max total size.
-    -FileCount      Number of files to generate (optional; default: random between 4 and 10).
     -Extensions     File extensions to use (default: conf, sql, bak, zip).
     -Keyword        Inject this keyword into some filenames (optional).
-    -CreatedDate    Specify a created date (e.g., "06/15/2023"). Modified dates will be random between created and current date.
+    -CreatedDate    Specify a created date (e.g., "06/15/2023").
     -Help           Display this help information.
 "@
     exit
 }
 
 # Validate required arguments
-if (-not $Scenario -or -not $MaxTotalSize -or (-not $RandomSize)) {
-    Write-Error "Required options missing: -Scenario, -MaxTotalSize, and -RandomSize."
+if (-not $Scenario -or -not $MaxTotalSize) {
+    Write-Error "Required options missing: -Scenario and -MaxTotalSize."
     exit
+}
+
+# Function to write random data to a file
+function Write-RandomFile {
+    param(
+        [string]$FileName,
+        [Int64]$FileSize
+    )
+    try {
+        $bufferSize = 1MB
+        $bytesRemaining = $FileSize
+        $fileStream = [System.IO.File]::Create($FileName)
+        $random = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+        $buffer = New-Object byte[] $bufferSize
+
+        while ($bytesRemaining -gt 0) {
+            $bytesToWrite = [Int64]([Math]::Min($bufferSize, $bytesRemaining))
+            $random.GetBytes($buffer)
+            $fileStream.Write($buffer, 0, [int]$bytesToWrite)
+            $bytesRemaining -= $bytesToWrite
+        }
+        $fileStream.Close()
+        Write-Host "Finished writing $FileName"
+    } catch {
+        Write-Error "Failed to write to ${FileName}: $_"
+    }
 }
 
 # Parse CreatedDate
 if ($CreatedDate) {
     try {
-        # Handle 2-digit year logic
-        $CreatedDate = if ($CreatedDate -match "/\d{2}$") {
-            $Year = [int]($CreatedDate.Split('/')[-1])
-            $Year = if ($Year -le [int](Get-Date -Year (Get-Date).Year).ToString("yy")) {
-                2000 + $Year
-            } else {
-                1900 + $Year
-            }
-            [datetime]::ParseExact("$($CreatedDate.Substring(0, $CreatedDate.Length - 2))/$Year", "MM/dd/yyyy", $null)
-        } else {
-            [datetime]::ParseExact($CreatedDate, "MM/dd/yyyy", $null)
-        }
+        $ParsedCreatedDate = [datetime]::Parse($CreatedDate, [System.Globalization.CultureInfo]::InvariantCulture)
+        # Write-Host "DEBUG: Parsed CreatedDate is $ParsedCreatedDate"
     } catch {
-        Write-Error "Invalid -CreatedDate format. Please use mm/dd/yyyy or mm/dd/yy."
+        Write-Error "Invalid -CreatedDate format. Please use a valid date format."
         exit
     }
-}
-
-# Determine file count
-if (-not $FileCount) {
-    $FileCount = Get-Random -Minimum 4 -Maximum 10
 }
 
 # Directory creation
@@ -69,32 +78,36 @@ New-Item -ItemType Directory -Path $TargetDir | Out-Null
 # Scenario-specific names and logic
 $NameDictionaries = @{
     "UserDatabase" = @("users.sql", "schema.sql", "config.conf", "backup.bak", "log.sql", "auth.sql")
-    "Backups" = @("full_backup.bak", "incremental_backup.bak", "backup_config.conf", "restore.sql")
-    "Random" = @("random_file.conf", "temp.sql", "archive.zip", "random_data.bak")
+    "Backups"      = @("full_backup.bak", "incremental_backup.bak", "backup_config.conf", "restore.sql")
+    "Random"       = @("random_file.conf", "temp.sql", "archive.zip", "random_data.bak")
 }
 
 # Initialize variables
-$TotalSize = 0
-$RemainingSize = [math]::Floor($MaxTotalSize * 0.95) # 95% of MaxTotalSize
-$MinConfSize = 1024    # 1 KB
-$MaxConfSize = 25600   # 25 KB
+[Int64]$TotalSize = 0
+$MinFileSize = 1MB
+$MaxFileSize = 2GB  # Increased maximum individual file size to 2 GB
 $GeneratedFiles = @()
-$UniqueNames = @() # Array for unique filenames
+$UniqueNames = @()     # Array for unique filenames
+$FileIndex = 1
 
-# Generate files
-for ($j = 1; $j -le $FileCount; $j++) {
+# Size limits for .conf files
+$ConfMinSize = 1KB
+$ConfMaxSize = 1000KB  # 1,000 KB = 1 MB
+
+# Generate files until MaxTotalSize is reached
+while ($TotalSize -lt $MaxTotalSize) {
     $FileType = Get-Random -InputObject $Extensions
 
     # Generate unique filenames
     $BaseFileName = if ($Scenario -ne "Random") {
         Get-Random -InputObject $NameDictionaries[$Scenario]
     } else {
-        "random_file_$j.$FileType"
+        "random_file_$FileIndex.$FileType"
     }
 
-    # Inject keyword into logical file types (sql, bak) with higher priority
+    # Inject keyword into logical file types
     if ($Keyword) {
-        $InjectKeyword = $FileType -in @("sql", "bak") -or (Get-Random -Minimum 0 -Maximum 2) -eq 1
+        $InjectKeyword = $FileType -in @("sql", "bak")
         if ($InjectKeyword) {
             $BaseFileName = "$Keyword" + "_" + $BaseFileName
         }
@@ -110,37 +123,96 @@ for ($j = 1; $j -le $FileCount; $j++) {
     $UniqueNames += $FileName
 
     # Determine file size
-    if ($FileType -eq "conf") {
-        $FileSize = Get-Random -Minimum $MinConfSize -Maximum $MaxConfSize
+    if ($RandomSize) {
+        # Calculate remaining size
+        $RemainingSize = $MaxTotalSize - $TotalSize
+
+        if ($FileType -eq "conf") {
+            # Set file size for .conf files between 1 KB and 1,000 KB
+            if ($ConfMaxSize -gt $RemainingSize) {
+                $ConfMaxSize = $RemainingSize
+            }
+            if ($ConfMinSize -gt $ConfMaxSize) {
+                $ConfMinSize = $ConfMaxSize
+            }
+            if ($ConfMinSize -eq $ConfMaxSize) {
+                $FileSize = $ConfMinSize
+            } else {
+                $FileSize = Get-Random -Minimum $ConfMinSize -Maximum $ConfMaxSize
+            }
+        } else {
+            # AdjustedMaxFileSize = Min($MaxFileSize, $RemainingSize)
+            if ($MaxFileSize -le $RemainingSize) {
+                $AdjustedMaxFileSize = $MaxFileSize
+            } else {
+                $AdjustedMaxFileSize = $RemainingSize
+            }
+
+            # Set a reasonable minimum file size
+            if ($MinFileSize -le $AdjustedMaxFileSize) {
+                $AdjustedMinFileSize = $MinFileSize
+            } else {
+                $AdjustedMinFileSize = $AdjustedMaxFileSize
+            }
+
+            # Random file size between AdjustedMinFileSize and AdjustedMaxFileSize
+            if ($AdjustedMinFileSize -eq $AdjustedMaxFileSize) {
+                [Int64]$FileSize = $AdjustedMinFileSize
+            } else {
+                [Int64]$FileSize = Get-Random -Minimum $AdjustedMinFileSize -Maximum $AdjustedMaxFileSize
+            }
+        }
     } else {
-        $FileSize = Get-Random -Minimum ([math]::Floor($RemainingSize * 0.1)) -Maximum ([math]::Floor($RemainingSize * 0.4))
+        # Fixed size files
+        if ($FileType -eq "conf") {
+            $FileSize = $ConfMinSize
+        } else {
+            [Int64]$FileSize = $MinFileSize
+        }
     }
 
-    # Ensure total size does not exceed max
+    # Adjust FileSize if it would exceed MaxTotalSize
     if ($TotalSize + $FileSize -gt $MaxTotalSize) {
         $FileSize = $MaxTotalSize - $TotalSize
     }
 
-    # Write random data to file
-    try {
-        $RandomData = [byte[]](Get-Random -Minimum 0 -Maximum 255) * $FileSize
-        [System.IO.File]::WriteAllBytes($FileName, $RandomData)
+    if ($FileSize -le 0) {
+        break
+    }
 
-        # Set created and modified dates
-        if ($CreatedDate) {
-            $ModifiedDate = Get-Random -Minimum $CreatedDate.Ticks -Maximum ([datetime]::Now.Ticks)
-            $ModifiedDate = [datetime]::FromFileTimeUtc($ModifiedDate)
-            (Get-Item $FileName).CreationTime = $CreatedDate
-            (Get-Item $FileName).LastWriteTime = $ModifiedDate
+    # Write random data to file
+    Write-RandomFile -FileName $FileName -FileSize $FileSize
+
+    # Set created and modified dates
+    if ($CreatedDate) {
+        $now = Get-Date
+        # Write-Host "DEBUG: \$now is of type $($now.GetType().FullName) with value $now"
+        # Write-Host "DEBUG: \$ParsedCreatedDate is of type $($ParsedCreatedDate.GetType().FullName) with value $ParsedCreatedDate"
+
+        try {
+            $TimeSpan = $now - $ParsedCreatedDate
+        } catch {
+            Write-Error "Failed to calculate TimeSpan: $_"
+            exit
         }
-    } catch {
-        Write-Error "Failed to write to $FileName. $_"
-        continue
+
+        if ($TimeSpan.TotalSeconds -gt 0) {
+            $TotalSeconds = [Int64][Math]::Floor($TimeSpan.TotalSeconds)
+            $RandomSeconds = Get-Random -Minimum 0 -Maximum $TotalSeconds
+            $ModifiedDate = $ParsedCreatedDate.AddSeconds($RandomSeconds)
+        } else {
+            $ModifiedDate = $ParsedCreatedDate
+        }
+        (Get-Item $FileName).CreationTime = $ParsedCreatedDate
+        (Get-Item $FileName).LastWriteTime = $ModifiedDate
     }
 
     $TotalSize += $FileSize
-    $RemainingSize -= $FileSize
-    $GeneratedFiles += @{"FileName"=$FileName;"FileSize"=[math]::Round($FileSize/1MB,2)}
+    $GeneratedFiles += @{
+        "FileName" = $FileName
+        "FileSize" = [math]::Round($FileSize / 1MB, 2)
+    }
+    $FileIndex++
 }
 
 # Output summary
